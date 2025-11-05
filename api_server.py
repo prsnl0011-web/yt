@@ -10,11 +10,15 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
+# 🔐 API key (use same one your frontend has)
 API_KEY = os.environ.get("API_KEY", "420679f1-73e2-42a0-bbea-a10b99bd5fde")
+
+# Folder for temporary downloads
 DOWNLOAD_DIR = os.path.join(os.getcwd(), "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# 🔁 Auto-delete downloaded files every 5 minutes
+
+# 🧹 Auto cleanup every 5 minutes
 def cleanup(interval=300):
     while True:
         time.sleep(interval)
@@ -25,23 +29,33 @@ def cleanup(interval=300):
                 pass
         print("🧹 Cleanup done.")
 
+
 threading.Thread(target=cleanup, daemon=True).start()
+
 
 @app.route("/")
 def home():
-    return jsonify({"message": "YouTube Downloader API active ✅"})
+    return jsonify({
+        "message": "YouTube Downloader API active ✅",
+        "info": "/api/info",
+        "download": "/api/download"
+    })
+
 
 @app.route("/api/info", methods=["POST"])
 def get_info():
     try:
-        data = request.get_json()
-        if not data or data.get("api_key") != API_KEY:
+        data = request.get_json() or {}
+        # ✅ Accept API key from header or body
+        client_key = request.headers.get("X-API-Key") or data.get("api_key")
+        if client_key != API_KEY:
             return jsonify({"error": "Invalid API key"}), 403
 
         url = data.get("url")
         if not url:
             return jsonify({"error": "Missing URL"}), 400
 
+        # Fetch video metadata
         cmd = [
             "yt-dlp",
             "-j",
@@ -59,7 +73,7 @@ def get_info():
         title = info.get("title", "Unknown Title")
         thumbnail = info.get("thumbnail")
 
-        # 🔹 Send only 3 quality options: Best MP4, Best MP3, and Audio-only (P3)
+        # Return only top 3 quality options
         qualities = [
             {"type": "mp4", "label": "🎥 Best MP4 (Video + Audio)", "url": url},
             {"type": "mp3", "label": "🎵 Best MP3 (Audio Only)", "url": url},
@@ -75,11 +89,14 @@ def get_info():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route("/api/download", methods=["POST"])
 def download():
     try:
-        data = request.get_json()
-        if not data or data.get("api_key") != API_KEY:
+        data = request.get_json() or {}
+        # ✅ Accept API key from header or body
+        client_key = request.headers.get("X-API-Key") or data.get("api_key")
+        if client_key != API_KEY:
             return jsonify({"error": "Invalid API key"}), 403
 
         url = data.get("url")
@@ -109,11 +126,9 @@ def download():
         if out.returncode != 0:
             raise RuntimeError(out.stderr.strip() or out.stdout.strip())
 
-        for f in os.listdir(DOWNLOAD_DIR):
-            if f.startswith(file_id):
-                file_name = f
-                break
-        else:
+        # Find downloaded file
+        file_name = next((f for f in os.listdir(DOWNLOAD_DIR) if f.startswith(file_id)), None)
+        if not file_name:
             raise RuntimeError("File not found after download")
 
         return jsonify({
@@ -123,9 +138,11 @@ def download():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route("/downloads/<path:filename>")
 def serve_download(filename):
     return send_from_directory(DOWNLOAD_DIR, filename, as_attachment=True)
+
 
 if __name__ == "__main__":
     print(f"✅ Backend running | API Key: {API_KEY}")

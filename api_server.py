@@ -10,11 +10,15 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
+# === CONFIG ===
 API_KEY = os.getenv("API_KEY", "420679f1-73e2-42a0-bbea-a10b99bd5fde")
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# --- automatic cleanup every 5 min ---
+# === JOB STORAGE ===
+jobs = {}
+
+# === AUTO CLEANUP ===
 def auto_clean():
     while True:
         now = time.time()
@@ -26,23 +30,15 @@ def auto_clean():
 
 threading.Thread(target=auto_clean, daemon=True).start()
 
-# --- health check ---
+# === HEALTH CHECK ===
 @app.route("/api/health")
 def health():
     return jsonify({"status": "ok"}), 200
 
 
-# --- fast info fetch ---
-@app.route("/api/info", methods=["POST"])
-def api_info():
-    if request.headers.get("X-API-Key") != API_KEY:
-        return jsonify({"error": "Invalid API key"}), 403
-
-    data = request.get_json() or {}
-    url = data.get("url")
-    if not url:
-        return jsonify({"error": "Missing URL"}), 400
-
+# === BACKGROUND WORKERS ===
+def run_yt_dlp_info(job_id, url):
+    """Background thread to fetch video info."""
     try:
         cmd = [
             "yt-dlp",
@@ -56,38 +52,26 @@ def api_info():
             "-j", url,
         ]
 
-        # shorter timeout so it always finishes before Render limit
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
-        raw_line = result.stdout.strip().split("\n")[0]
-        info = json.loads(raw_line)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        info = json.loads(result.stdout.strip().split("\n")[0])
 
-        return jsonify({
-            "title": info.get("title", "Unknown Title"),
-            "thumbnail": info.get("thumbnail", ""),
-            "qualities": [
-                {"label": "🎥 Highest Quality (MP4)", "type": "mp4", "url": url},
-                {"label": "🎵 Highest Quality (MP3)", "type": "mp3", "url": url}
-            ]
-        })
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "Timeout fetching video info (YouTube may be slow)"}), 504
+        jobs[job_id] = {
+            "status": "done",
+            "data": {
+                "title": info.get("title", "Unknown Title"),
+                "thumbnail": info.get("thumbnail", ""),
+                "qualities": [
+                    {"label": "🎥 Highest Quality (MP4)", "type": "mp4", "url": url},
+                    {"label": "🎵 Highest Quality (MP3)", "type": "mp3", "url": url}
+                ]
+            }
+        }
     except Exception as e:
-        print("INFO ERROR:", e)
-        return jsonify({"error": str(e)}), 500
+        jobs[job_id] = {"status": "error", "error": str(e)}
 
 
-# --- download handler ---
-@app.route("/api/download", methods=["POST"])
-def api_download():
-    if request.headers.get("X-API-Key") != API_KEY:
-        return jsonify({"error": "Invalid API key"}), 403
-
-    data = request.get_json() or {}
-    url = data.get("url")
-    kind = data.get("type")
-    if not url or kind not in ["mp4", "mp3"]:
-        return jsonify({"error": "Missing or invalid download type"}), 400
-
+def run_yt_dlp_download(job_id, url, kind):
+    """Background thread to download the file."""
     try:
         file_id = str(uuid.uuid4())
         base_output = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
@@ -119,15 +103,59 @@ def api_download():
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip())
 
-        # find the resulting file
+        # Find file
         for f in os.listdir(DOWNLOAD_DIR):
             if f.startswith(file_id.split('-')[0]) or f.startswith(file_id):
-                return jsonify({"download_url": f"/downloads/{f}"})
-        return jsonify({"error": "File not found after download"}), 500
+                jobs[job_id] = {
+                    "status": "done",
+                    "download_url": f"/downloads/{f}"
+                }
+                return
 
+        jobs[job_id] = {"status": "error", "error": "File not found after download"}
     except Exception as e:
-        print("DOWNLOAD ERROR:", e)
-        return jsonify({"error": str(e)}), 500
+        jobs[job_id] = {"status": "error", "error": str(e)}
+
+
+# === ROUTES ===
+@app.route("/api/info", methods=["POST"])
+def api_info():
+    if request.headers.get("X-API-Key") != API_KEY:
+        return jsonify({"error": "Invalid API key"}), 403
+
+    url = (request.get_json() or {}).get("url")
+    if not url:
+        return jsonify({"error": "Missing URL"}), 400
+
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "running"}
+    threading.Thread(target=run_yt_dlp_info, args=(job_id, url), daemon=True).start()
+    return jsonify({"job_id": job_id}), 202
+
+
+@app.route("/api/download", methods=["POST"])
+def api_download():
+    if request.headers.get("X-API-Key") != API_KEY:
+        return jsonify({"error": "Invalid API key"}), 403
+
+    data = request.get_json() or {}
+    url, kind = data.get("url"), data.get("type")
+
+    if not url or kind not in ["mp4", "mp3"]:
+        return jsonify({"error": "Missing or invalid parameters"}), 400
+
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "running"}
+    threading.Thread(target=run_yt_dlp_download, args=(job_id, url, kind), daemon=True).start()
+    return jsonify({"job_id": job_id}), 202
+
+
+@app.route("/api/status/<job_id>")
+def api_status(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Invalid job ID"}), 404
+    return jsonify(job)
 
 
 @app.route("/downloads/<path:filename>")
@@ -135,9 +163,11 @@ def serve_file(filename):
     return send_from_directory(DOWNLOAD_DIR, filename, as_attachment=True)
 
 
+# === MAIN ===
 if __name__ == "__main__":
     print("\n✅ Server ready!")
     print(f"API Key: {API_KEY}")
     print(f"  info: http://localhost:5000/api/info")
-    print(f"  download: http://localhost:5000/api/download\n")
+    print(f"  download: http://localhost:5000/api/download")
+    print(f"  status: http://localhost:5000/api/status/<job_id>\n")
     app.run(host="0.0.0.0", port=5000, debug=True)

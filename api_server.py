@@ -1,25 +1,22 @@
 import os
+import subprocess
 import json
 import uuid
-import subprocess
-import threading
 import time
+import threading
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-
-app = Flask(__name__)
-CORS(app)
 
 # === CONFIG ===
 API_KEY = os.getenv("API_KEY", "420679f1-73e2-42a0-bbea-a10b99bd5fde")
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# === JOB STORAGE ===
-jobs = {}
+app = Flask(__name__)
+CORS(app)
 
-# === AUTO CLEANUP ===
-def auto_clean():
+# === AUTO CLEANUP (delete old files every 5 min) ===
+def auto_cleanup():
     while True:
         now = time.time()
         for f in os.listdir(DOWNLOAD_DIR):
@@ -28,7 +25,7 @@ def auto_clean():
                 os.remove(path)
         time.sleep(300)
 
-threading.Thread(target=auto_clean, daemon=True).start()
+threading.Thread(target=auto_cleanup, daemon=True).start()
 
 # === HEALTH CHECK ===
 @app.route("/api/health")
@@ -36,9 +33,18 @@ def health():
     return jsonify({"status": "ok"}), 200
 
 
-# === BACKGROUND WORKERS ===
-def run_yt_dlp_info(job_id, url):
-    """Background thread to fetch video info."""
+# === GET VIDEO INFO ===
+@app.route("/api/info", methods=["POST"])
+def api_info():
+    if request.headers.get("X-API-Key") != API_KEY:
+        return jsonify({"error": "Invalid API key"}), 403
+
+    data = request.get_json() or {}
+    url = data.get("url")
+
+    if not url:
+        return jsonify({"error": "Missing URL"}), 400
+
     try:
         cmd = [
             "yt-dlp",
@@ -48,126 +54,92 @@ def run_yt_dlp_info(job_id, url):
             "--geo-bypass",
             "--extractor-args", "youtubetab:skip=authcheck",
             "--cookies", "cookies.txt",
-            "--youtube-skip-dash-manifest",
             "-j", url,
         ]
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         info = json.loads(result.stdout.strip().split("\n")[0])
 
-        jobs[job_id] = {
-            "status": "done",
-            "data": {
-                "title": info.get("title", "Unknown Title"),
-                "thumbnail": info.get("thumbnail", ""),
-                "qualities": [
-                    {"label": "🎥 Highest Quality (MP4)", "type": "mp4", "url": url},
-                    {"label": "🎵 Highest Quality (MP3)", "type": "mp3", "url": url}
-                ]
-            }
-        }
-    except Exception as e:
-        jobs[job_id] = {"status": "error", "error": str(e)}
+        title = info.get("title", "Unknown Title")
+        thumbnail = info.get("thumbnail", "")
 
-
-def run_yt_dlp_download(job_id, url, kind):
-    """Background thread to download the file."""
-    try:
-        file_id = str(uuid.uuid4())
-        base_output = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
-
-        if kind == "mp4":
-            cmd = [
-                "yt-dlp",
-                "--cookies", "cookies.txt",
-                "--extractor-args", "youtubetab:skip=authcheck",
-                "-f", "bv*+ba/b",
-                "--merge-output-format", "mp4",
-                "-o", base_output,
-                url,
-            ]
-        else:
-            cmd = [
-                "yt-dlp",
-                "--cookies", "cookies.txt",
-                "--extractor-args", "youtubetab:skip=authcheck",
-                "-f", "bestaudio/b",
-                "--extract-audio",
-                "--audio-format", "mp3",
-                "--audio-quality", "0",
-                "-o", base_output,
-                url,
-            ]
-
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or result.stdout.strip())
-
-        # Find file
-        for f in os.listdir(DOWNLOAD_DIR):
-            if f.startswith(file_id.split('-')[0]) or f.startswith(file_id):
-                jobs[job_id] = {
-                    "status": "done",
-                    "download_url": f"/downloads/{f}"
+        response = {
+            "title": title,
+            "thumbnail": thumbnail,
+            "qualities": [
+                {
+                    "label": "🎥 Download Best Quality (MP4)",
+                    "type": "mp4",
+                    "url": url
                 }
-                return
+            ]
+        }
+        return jsonify(response)
 
-        jobs[job_id] = {"status": "error", "error": "File not found after download"}
     except Exception as e:
-        jobs[job_id] = {"status": "error", "error": str(e)}
+        return jsonify({"error": str(e)}), 500
 
 
-# === ROUTES ===
-@app.route("/api/info", methods=["POST"])
-def api_info():
-    if request.headers.get("X-API-Key") != API_KEY:
-        return jsonify({"error": "Invalid API key"}), 403
-
-    url = (request.get_json() or {}).get("url")
-    if not url:
-        return jsonify({"error": "Missing URL"}), 400
-
-    job_id = str(uuid.uuid4())
-    jobs[job_id] = {"status": "running"}
-    threading.Thread(target=run_yt_dlp_info, args=(job_id, url), daemon=True).start()
-    return jsonify({"job_id": job_id}), 202
-
-
+# === DOWNLOAD BEST VIDEO ===
 @app.route("/api/download", methods=["POST"])
 def api_download():
     if request.headers.get("X-API-Key") != API_KEY:
         return jsonify({"error": "Invalid API key"}), 403
 
     data = request.get_json() or {}
-    url, kind = data.get("url"), data.get("type")
+    url = data.get("url")
 
-    if not url or kind not in ["mp4", "mp3"]:
-        return jsonify({"error": "Missing or invalid parameters"}), 400
+    if not url:
+        return jsonify({"error": "Missing URL"}), 400
 
-    job_id = str(uuid.uuid4())
-    jobs[job_id] = {"status": "running"}
-    threading.Thread(target=run_yt_dlp_download, args=(job_id, url, kind), daemon=True).start()
-    return jsonify({"job_id": job_id}), 202
+    try:
+        # Sanitize filename
+        file_id = str(uuid.uuid4())
+        output_template = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
+
+        cmd = [
+            "yt-dlp",
+            "--cookies", "cookies.txt",
+            "--extractor-args", "youtubetab:skip=authcheck",
+            "-f", "bv*+ba/best",
+            "--merge-output-format", "mp4",
+            "-o", output_template,
+            url,
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+
+        # Find the downloaded file
+        downloaded = None
+        for f in os.listdir(DOWNLOAD_DIR):
+            if f.startswith(file_id):
+                downloaded = f
+                break
+
+        if not downloaded:
+            raise FileNotFoundError("Downloaded file not found")
+
+        return jsonify({
+            "download_url": f"/downloads/{downloaded}"
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/status/<job_id>")
-def api_status(job_id):
-    job = jobs.get(job_id)
-    if not job:
-        return jsonify({"error": "Invalid job ID"}), 404
-    return jsonify(job)
-
-
+# === SERVE FILES ===
 @app.route("/downloads/<path:filename>")
 def serve_file(filename):
     return send_from_directory(DOWNLOAD_DIR, filename, as_attachment=True)
 
 
-# === MAIN ===
+# === MAIN APP ===
 if __name__ == "__main__":
     print("\n✅ Server ready!")
     print(f"API Key: {API_KEY}")
     print(f"  info: http://localhost:5000/api/info")
-    print(f"  download: http://localhost:5000/api/download")
-    print(f"  status: http://localhost:5000/api/status/<job_id>\n")
+    print(f"  download: http://localhost:5000/api/download\n")
     app.run(host="0.0.0.0", port=5000, debug=True)

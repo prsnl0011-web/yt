@@ -1,13 +1,13 @@
 import os
 import json
 import uuid
-import shutil
 import subprocess
 import threading
 import time
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
+# === Basic App Setup ===
 app = Flask(__name__)
 CORS(app)
 
@@ -15,29 +15,29 @@ API_KEY = os.getenv("API_KEY", "420679f1-73e2-42a0-bbea-a10b99bd5fde")
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# 🧹 Auto-clean every 5 minutes
+# === Auto Cleanup ===
 def auto_clean():
     while True:
+        now = time.time()
         try:
-            now = time.time()
             for f in os.listdir(DOWNLOAD_DIR):
                 path = os.path.join(DOWNLOAD_DIR, f)
                 if os.path.isfile(path) and now - os.path.getmtime(path) > 300:
                     os.remove(path)
         except Exception as e:
-            print("Cleanup error:", e)
+            print("🧹 Cleanup error:", e)
         time.sleep(300)
 
 threading.Thread(target=auto_clean, daemon=True).start()
 
 
-# ✅ Health check endpoint (for UptimeRobot)
+# === Health Check ===
 @app.route("/api/health")
 def health():
     return jsonify({"status": "ok"}), 200
 
 
-# 🎥 Fetch video info
+# === Fetch Video Info ===
 @app.route("/api/info", methods=["POST"])
 def api_info():
     if request.headers.get("X-API-Key") != API_KEY:
@@ -45,7 +45,6 @@ def api_info():
 
     data = request.get_json()
     url = data.get("url")
-
     if not url:
         return jsonify({"error": "Missing URL"}), 400
 
@@ -57,18 +56,21 @@ def api_info():
             "-j",
             url,
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
-        info = json.loads(result.stdout.strip().split("\n")[0])
+        # Increased timeout to 90 seconds
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
 
-        video_title = info.get("title", "Unknown Title")
-        thumbnail = info.get("thumbnail", "")
+        raw_output = result.stdout.strip().split("\n")[0]
+        info = json.loads(raw_output)
+
+        title = info.get("title", "Unknown Title")
+        thumb = info.get("thumbnail", "")
 
         return jsonify({
-            "title": video_title,
-            "thumbnail": thumbnail,
+            "title": title,
+            "thumbnail": thumb,
             "qualities": [
                 {"label": "🎥 Highest Quality (MP4)", "type": "mp4", "url": url},
-                {"label": "🎵 Highest Quality (MP3)", "type": "mp3", "url": url},
+                {"label": "🎵 Highest Quality (MP3)", "type": "mp3", "url": url}
             ]
         })
     except subprocess.TimeoutExpired:
@@ -78,7 +80,7 @@ def api_info():
         return jsonify({"error": str(e)}), 500
 
 
-# ⬇️ Download endpoint
+# === Download Video/Audio ===
 @app.route("/api/download", methods=["POST"])
 def api_download():
     if request.headers.get("X-API-Key") != API_KEY:
@@ -86,29 +88,26 @@ def api_download():
 
     data = request.get_json()
     url = data.get("url")
-    kind = data.get("type", "mp4")
+    kind = data.get("type")
 
-    if not url:
-        return jsonify({"error": "Missing URL"}), 400
+    if not url or kind not in ["mp4", "mp3"]:
+        return jsonify({"error": "Missing or invalid download type"}), 400
 
     try:
         file_id = str(uuid.uuid4())
-        base_filename = f"{file_id}.%(ext)s"
-        out_path = os.path.join(DOWNLOAD_DIR, base_filename)
+        base_output = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
 
         if kind == "mp4":
-            # 🎥 Download highest-quality MP4
             cmd = [
                 "yt-dlp",
                 "--cookies", "cookies.txt",
                 "--extractor-args", "youtubetab:skip=authcheck",
                 "-f", "bv*+ba/b",
                 "--merge-output-format", "mp4",
-                "-o", out_path,
+                "-o", base_output,
                 url,
             ]
-        elif kind == "mp3":
-            # 🎵 Extract best audio and convert to MP3
+        else:  # MP3
             cmd = [
                 "yt-dlp",
                 "--cookies", "cookies.txt",
@@ -117,23 +116,18 @@ def api_download():
                 "--extract-audio",
                 "--audio-format", "mp3",
                 "--audio-quality", "0",
-                "-o", out_path,
+                "-o", base_output,
                 url,
             ]
-        else:
-            return jsonify({"error": "Invalid download type"}), 400
 
         result = subprocess.run(cmd, capture_output=True, text=True)
-
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip())
 
-        # 🔍 Find the final file
+        # Find generated file
         for file in os.listdir(DOWNLOAD_DIR):
             if file.startswith(file_id.split('-')[0]) or file.startswith(file_id):
-                return jsonify({
-                    "download_url": f"/downloads/{file}"
-                })
+                return jsonify({"download_url": f"/downloads/{file}"})
 
         return jsonify({"error": "File not found after download"}), 500
 
@@ -142,16 +136,16 @@ def api_download():
         return jsonify({"error": str(e)}), 500
 
 
-# 📦 Serve downloaded files
+# === Serve Files ===
 @app.route("/downloads/<path:filename>")
 def serve_file(filename):
     return send_from_directory(DOWNLOAD_DIR, filename, as_attachment=True)
 
 
+# === Start Server ===
 if __name__ == "__main__":
     print("\n✅ Server ready!")
     print(f"API Key: {API_KEY}")
     print(f"  info: http://localhost:5000/api/info")
     print(f"  download: http://localhost:5000/api/download\n")
-
     app.run(host="0.0.0.0", port=5000, debug=True)

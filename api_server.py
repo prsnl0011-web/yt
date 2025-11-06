@@ -1,7 +1,7 @@
 import os
 import subprocess
 import json
-import uuid
+import re
 import time
 import threading
 from flask import Flask, request, jsonify, send_from_directory
@@ -15,7 +15,7 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 app = Flask(__name__)
 CORS(app)
 
-# === AUTO CLEANUP (delete old files every 5 min) ===
+# === AUTO CLEANUP (delete files older than 5 minutes) ===
 def auto_cleanup():
     while True:
         now = time.time()
@@ -26,6 +26,16 @@ def auto_cleanup():
         time.sleep(300)
 
 threading.Thread(target=auto_cleanup, daemon=True).start()
+
+
+# === CLEAN TITLE FOR SAFE FILENAME ===
+def clean_filename(name: str) -> str:
+    # Remove unsafe characters
+    name = re.sub(r'[\\/*?:"<>|]', "", name)
+    # Trim and limit length
+    name = name.strip()[:180]
+    return name or "video"
+
 
 # === HEALTH CHECK ===
 @app.route("/api/health")
@@ -80,7 +90,7 @@ def api_info():
         return jsonify({"error": str(e)}), 500
 
 
-# === DOWNLOAD BEST VIDEO ===
+# === DOWNLOAD BEST QUALITY VIDEO (WITH AUDIO) ===
 @app.route("/api/download", methods=["POST"])
 def api_download():
     if request.headers.get("X-API-Key") != API_KEY:
@@ -93,44 +103,48 @@ def api_download():
         return jsonify({"error": "Missing URL"}), 400
 
     try:
-        # Sanitize filename
-        file_id = str(uuid.uuid4())
-        output_template = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
+        # Get the video title first
+        info_cmd = [
+            "yt-dlp",
+            "--no-warnings",
+            "--skip-download",
+            "--no-check-certificates",
+            "--cookies", "cookies.txt",
+            "-j", url,
+        ]
+        info_proc = subprocess.run(info_cmd, capture_output=True, text=True, timeout=60)
+        info = json.loads(info_proc.stdout.strip().split("\n")[0])
+        title = clean_filename(info.get("title", "video"))
+        filename = f"{title}.mp4"
+        output_path = os.path.join(DOWNLOAD_DIR, filename)
 
+        # Download the best quality with audio
         cmd = [
             "yt-dlp",
             "--cookies", "cookies.txt",
             "--extractor-args", "youtubetab:skip=authcheck",
             "-f", "bv*+ba/best",
             "--merge-output-format", "mp4",
-            "-o", output_template,
+            "-o", output_path,
             url,
         ]
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip())
 
-        # Find the downloaded file
-        downloaded = None
-        for f in os.listdir(DOWNLOAD_DIR):
-            if f.startswith(file_id):
-                downloaded = f
-                break
-
-        if not downloaded:
-            raise FileNotFoundError("Downloaded file not found")
+        if not os.path.exists(output_path):
+            raise FileNotFoundError("Download failed or file not found")
 
         return jsonify({
-            "download_url": f"/downloads/{downloaded}"
+            "download_url": f"/downloads/{filename}"
         })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-# === SERVE FILES ===
+# === SERVE DOWNLOADED FILES ===
 @app.route("/downloads/<path:filename>")
 def serve_file(filename):
     return send_from_directory(DOWNLOAD_DIR, filename, as_attachment=True)
